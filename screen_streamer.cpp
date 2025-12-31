@@ -2,6 +2,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <commctrl.h>
+#include <shellscalingapi.h>
 #include <vector>
 #include <string>
 #include <thread>
@@ -12,6 +13,7 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "shcore.lib")
 
 const int DISPLAY_WIDTH = 240;
 const int DISPLAY_HEIGHT = 135;
@@ -31,14 +33,7 @@ const int UDP_PORT = 3333;
 #define ID_START_STOP_BUTTON 1001
 #define ID_CURSOR_CHECK 1002
 #define ID_FPS_COMBO 1003
-#define ID_FIT_MODE_COMBO 1004
 #define ID_SCREEN_COMBO 1005
-
-enum FitMode {
-    FIT_MODE_FILL = 0,    // Fill entire display (stretches proportionally, may crop)
-    FIT_MODE_FIT = 1,     // Fit to display (letterbox/pillarbox, no crop)
-    FIT_MODE_STRETCH = 2  // Stretch to fill (distorts aspect ratio)
-};
 
 struct MonitorInfo {
     HMONITOR hMonitor;
@@ -50,7 +45,7 @@ struct MonitorInfo {
 std::vector<MonitorInfo> g_monitors;
 
 HWND g_hwndMain, g_hwndStatus, g_hwndFPS, g_hwndIP, g_hwndStartStop;
-HWND g_hwndCursorCheck, g_hwndFPSCombo, g_hwndPreview, g_hwndFitModeCombo, g_hwndScreenCombo;
+HWND g_hwndCursorCheck, g_hwndFPSCombo, g_hwndPreview, g_hwndScreenCombo;
 HBRUSH g_hBrushBg;
 HFONT g_hFontLarge, g_hFontNormal, g_hFontSmall;
 std::thread* g_streamThread = nullptr;
@@ -59,8 +54,8 @@ std::vector<uint16_t> g_previewBuffer;
 std::atomic<bool> g_streaming(false);
 std::atomic<bool> g_showCursor(true);
 std::atomic<int> g_targetFPS(30);
-std::atomic<int> g_fitMode(FIT_MODE_FILL);
 std::atomic<int> g_selectedScreen(0);
+std::atomic<int> g_lastSelectedScreen(0);
 
 inline uint8_t clamp(int val) {
     return (val < 0) ? 0 : (val > 255) ? 255 : val;
@@ -93,35 +88,43 @@ private:
     std::vector<uint16_t> frameBuffer;
     std::vector<uint8_t> sendBuffer;
     int screenWidth, screenHeight;
+    int currentScreenIdx;
+    int monitorLeft, monitorTop;
 
-public:
-    ScreenStreamer(const char* ip, int port) {
-        WSADATA wsaData;
-        WSAStartup(MAKEWORD(2, 2), &wsaData);
-        sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        int sendBufSize = 512 * 1024;
-        setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char*)&sendBufSize, sizeof(sendBufSize));
-        DWORD timeout = 1;
-        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
-
-        dest_addr.sin_family = AF_INET;
-        dest_addr.sin_port = htons(port);
-        inet_pton(AF_INET, ip, &dest_addr.sin_addr);
-
-        SetProcessDPIAware();
+    void setupCapture() {
+        // Clean up ALL existing resources
+        if (hbmScreen) {
+            DeleteObject(hbmScreen);
+            hbmScreen = NULL;
+        }
+        if (hdcMem) {
+            DeleteDC(hdcMem);
+            hdcMem = NULL;
+        }
+        if (hdcScreen) {
+            ReleaseDC(NULL, hdcScreen);
+            hdcScreen = NULL;
+        }
+        
+        currentScreenIdx = g_selectedScreen.load();
+        g_lastSelectedScreen = currentScreenIdx;
         
         // Get selected monitor info
-        int screenIdx = g_selectedScreen.load();
-        if (screenIdx >= 0 && screenIdx < (int)g_monitors.size()) {
-            RECT monRect = g_monitors[screenIdx].rect;
+        if (currentScreenIdx >= 0 && currentScreenIdx < (int)g_monitors.size()) {
+            RECT monRect = g_monitors[currentScreenIdx].rect;
             screenWidth = monRect.right - monRect.left;
             screenHeight = monRect.bottom - monRect.top;
-            hdcScreen = CreateDCA("DISPLAY", NULL, NULL, NULL);
+            monitorLeft = monRect.left;
+            monitorTop = monRect.top;
         } else {
-            hdcScreen = GetDC(NULL);
-            screenWidth = GetDeviceCaps(hdcScreen, HORZRES);
-            screenHeight = GetDeviceCaps(hdcScreen, VERTRES);
+            screenWidth = GetSystemMetrics(SM_CXSCREEN);
+            screenHeight = GetSystemMetrics(SM_CYSCREEN);
+            monitorLeft = 0;
+            monitorTop = 0;
         }
+        
+        // Get fresh DC for the entire virtual desktop
+        hdcScreen = GetDC(NULL);
 
         hdcMem = CreateCompatibleDC(hdcScreen);
         hbmScreen = CreateCompatibleBitmap(hdcScreen, screenWidth, screenHeight);
@@ -136,8 +139,26 @@ public:
         bi.biCompression = BI_RGB;
 
         screenBuffer.resize(screenWidth * screenHeight * 4);
+    }
+
+public:
+    ScreenStreamer(const char* ip, int port) : hdcScreen(NULL), hdcMem(NULL), hbmScreen(NULL) {
+        WSADATA wsaData;
+        WSAStartup(MAKEWORD(2, 2), &wsaData);
+        sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        int sendBufSize = 512 * 1024;
+        setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char*)&sendBufSize, sizeof(sendBufSize));
+        DWORD timeout = 1;
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
+
+        dest_addr.sin_family = AF_INET;
+        dest_addr.sin_port = htons(port);
+        inet_pton(AF_INET, ip, &dest_addr.sin_addr);
+        
         frameBuffer.resize(DISPLAY_WIDTH * DISPLAY_HEIGHT);
         sendBuffer.resize(CHUNK_SIZE + 3);
+        
+        setupCapture();
     }
 
     ~ScreenStreamer() {
@@ -149,117 +170,70 @@ public:
     }
 
     void captureAndResize() {
-        int screenIdx = g_selectedScreen.load();
-        int offsetX = 0, offsetY = 0;
-        if (screenIdx >= 0 && screenIdx < (int)g_monitors.size()) {
-            offsetX = g_monitors[screenIdx].rect.left;
-            offsetY = g_monitors[screenIdx].rect.top;
+        // Check if screen selection changed - reinitialize if needed
+        int newScreenIdx = g_selectedScreen.load();
+        if (newScreenIdx != currentScreenIdx) {
+            setupCapture();
         }
         
-        BitBlt(hdcMem, 0, 0, screenWidth, screenHeight, hdcScreen, offsetX, offsetY, SRCCOPY);
+        BitBlt(hdcMem, 0, 0, screenWidth, screenHeight, hdcScreen, monitorLeft, monitorTop, SRCCOPY);
         
         if (g_showCursor) {
             CURSORINFO ci = { sizeof(CURSORINFO) };
             if (GetCursorInfo(&ci) && ci.flags == CURSOR_SHOWING) {
                 POINT pt;
                 GetCursorPos(&pt);
-                DrawIconEx(hdcMem, pt.x, pt.y, ci.hCursor, 0, 0, 0, NULL, DI_NORMAL);
+                // Adjust cursor position relative to current monitor
+                int cursorX = pt.x - monitorLeft;
+                int cursorY = pt.y - monitorTop;
+                // Only draw cursor if it's on this monitor
+                if (cursorX >= 0 && cursorX < screenWidth && cursorY >= 0 && cursorY < screenHeight) {
+                    DrawIconEx(hdcMem, cursorX, cursorY, ci.hCursor, 0, 0, 0, NULL, DI_NORMAL);
+                }
             }
         }
         
         GetDIBits(hdcMem, hbmScreen, 0, screenHeight, screenBuffer.data(), (BITMAPINFO*)&bi, DIB_RGB_COLORS);
 
-        int mode = g_fitMode.load();
+        // Calculate aspect ratio scaling to fit with black borders
+        float screenAspect = (float)screenWidth / screenHeight;
+        float displayAspect = (float)DISPLAY_WIDTH / DISPLAY_HEIGHT;
         
-        if (mode == FIT_MODE_STRETCH) {
-            // Stretch: Direct proportional mapping (distorts aspect ratio)
-            for (int y = 0; y < DISPLAY_HEIGHT; y++) {
-                for (int x = 0; x < DISPLAY_WIDTH; x++) {
-                    int src_x = (x * screenWidth) / DISPLAY_WIDTH;
-                    int src_y = (y * screenHeight) / DISPLAY_HEIGHT;
-                    if (src_x >= screenWidth) src_x = screenWidth - 1;
-                    if (src_y >= screenHeight) src_y = screenHeight - 1;
-                    
-                    int src_idx = (src_y * screenWidth + src_x) * 4;
-                    uint8_t b = screenBuffer[src_idx];
-                    uint8_t g = screenBuffer[src_idx + 1];
-                    uint8_t r = screenBuffer[src_idx + 2];
-                    frameBuffer[y * DISPLAY_WIDTH + x] = rgb888_to_rgb565(r, g, b);
-                }
-            }
-        } else if (mode == FIT_MODE_FIT) {
-            // Fit: Maintain aspect ratio with letterbox/pillarbox (no crop)
-            float screenAspect = (float)screenWidth / screenHeight;
-            float displayAspect = (float)DISPLAY_WIDTH / DISPLAY_HEIGHT;
-            
-            int srcWidth, srcHeight, srcOffsetX, srcOffsetY;
-            
-            if (screenAspect > displayAspect) {
-                // Screen is wider - letterbox (black bars top/bottom)
-                srcHeight = screenHeight;
-                srcWidth = (int)(screenHeight * displayAspect);
-                srcOffsetX = (screenWidth - srcWidth) / 2;
-                srcOffsetY = 0;
-            } else {
-                // Screen is taller - pillarbox (black bars left/right)
-                srcWidth = screenWidth;
-                srcHeight = (int)(screenWidth / displayAspect);
-                srcOffsetX = 0;
-                srcOffsetY = (screenHeight - srcHeight) / 2;
-            }
-            
-            // Clear to black first
-            memset(frameBuffer.data(), 0, FRAME_SIZE);
-            
-            for (int y = 0; y < DISPLAY_HEIGHT; y++) {
-                for (int x = 0; x < DISPLAY_WIDTH; x++) {
-                    int src_x = srcOffsetX + (x * srcWidth) / DISPLAY_WIDTH;
-                    int src_y = srcOffsetY + (y * srcHeight) / DISPLAY_HEIGHT;
-                    
-                    if (src_x >= 0 && src_x < screenWidth && src_y >= 0 && src_y < screenHeight) {
-                        int src_idx = (src_y * screenWidth + src_x) * 4;
-                        uint8_t b = screenBuffer[src_idx];
-                        uint8_t g = screenBuffer[src_idx + 1];
-                        uint8_t r = screenBuffer[src_idx + 2];
-                        frameBuffer[y * DISPLAY_WIDTH + x] = rgb888_to_rgb565(r, g, b);
-                    }
-                }
-            }
+        int displayW, displayH, offsetX, offsetY;
+        
+        if (screenAspect > displayAspect) {
+            // Screen is wider - use full width, add top/bottom black bars
+            displayW = DISPLAY_WIDTH;
+            displayH = (int)(DISPLAY_WIDTH / screenAspect);
+            offsetX = 0;
+            offsetY = (DISPLAY_HEIGHT - displayH) / 2;
         } else {
-            // Fill: Crop to fill entire display (maintains aspect ratio, may crop edges)
-            float screenAspect = (float)screenWidth / screenHeight;
-            float displayAspect = (float)DISPLAY_WIDTH / DISPLAY_HEIGHT;
-            
-            int srcWidth, srcHeight, srcOffsetX, srcOffsetY;
-            
-            if (screenAspect > displayAspect) {
-                // Screen is wider - crop sides
-                srcHeight = screenHeight;
-                srcWidth = (int)(screenHeight * displayAspect);
-                srcOffsetX = (screenWidth - srcWidth) / 2;
-                srcOffsetY = 0;
-            } else {
-                // Screen is taller - crop top/bottom
-                srcWidth = screenWidth;
-                srcHeight = (int)(screenWidth / displayAspect);
-                srcOffsetX = 0;
-                srcOffsetY = (screenHeight - srcHeight) / 2;
-            }
-            
-            for (int y = 0; y < DISPLAY_HEIGHT; y++) {
-                for (int x = 0; x < DISPLAY_WIDTH; x++) {
-                    int src_x = srcOffsetX + (x * srcWidth) / DISPLAY_WIDTH;
-                    int src_y = srcOffsetY + (y * srcHeight) / DISPLAY_HEIGHT;
-                    
-                    if (src_x >= screenWidth) src_x = screenWidth - 1;
-                    if (src_y >= screenHeight) src_y = screenHeight - 1;
-                    
-                    int src_idx = (src_y * screenWidth + src_x) * 4;
-                    uint8_t b = screenBuffer[src_idx];
-                    uint8_t g = screenBuffer[src_idx + 1];
-                    uint8_t r = screenBuffer[src_idx + 2];
-                    frameBuffer[y * DISPLAY_WIDTH + x] = rgb888_to_rgb565(r, g, b);
-                }
+            // Screen is taller - use full height, add left/right black bars
+            displayH = DISPLAY_HEIGHT;
+            displayW = (int)(DISPLAY_HEIGHT * screenAspect);
+            offsetX = (DISPLAY_WIDTH - displayW) / 2;
+            offsetY = 0;
+        }
+        
+        // Clear to black
+        memset(frameBuffer.data(), 0, FRAME_SIZE);
+        
+        // Scale screen to fit display area
+        for (int y = 0; y < displayH; y++) {
+            for (int x = 0; x < displayW; x++) {
+                int src_x = (x * screenWidth) / displayW;
+                int src_y = (y * screenHeight) / displayH;
+                if (src_x >= screenWidth) src_x = screenWidth - 1;
+                if (src_y >= screenHeight) src_y = screenHeight - 1;
+                
+                int src_idx = (src_y * screenWidth + src_x) * 4;
+                uint8_t b = screenBuffer[src_idx];
+                uint8_t g = screenBuffer[src_idx + 1];
+                uint8_t r = screenBuffer[src_idx + 2];
+                
+                int dst_x = offsetX + x;
+                int dst_y = offsetY + y;
+                frameBuffer[dst_y * DISPLAY_WIDTH + dst_x] = rgb888_to_rgb565(r, g, b);
             }
         }
         
@@ -586,9 +560,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 int sel = SendMessageA(g_hwndFPSCombo, CB_GETCURSEL, 0, 0);
                 int fps_values[] = {15, 20, 25, 30, 40, 50, 60};
                 if (sel >= 0 && sel < 7) g_targetFPS = fps_values[sel];
-            } else if (HIWORD(wParam) == CBN_SELCHANGE && LOWORD(wParam) == ID_FIT_MODE_COMBO) {
-                int sel = SendMessageA(g_hwndFitModeCombo, CB_GETCURSEL, 0, 0);
-                if (sel >= 0 && sel <= 2) g_fitMode = sel;
             } else if (HIWORD(wParam) == CBN_SELCHANGE && LOWORD(wParam) == ID_SCREEN_COMBO) {
                 int sel = SendMessageA(g_hwndScreenCombo, CB_GETCURSEL, 0, 0);
                 if (sel >= 0 && sel < (int)g_monitors.size()) g_selectedScreen = sel;
@@ -609,6 +580,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
+    // MUST be first - before any other Windows calls
+    // Use Per-Monitor DPI Awareness V2 for proper multi-monitor support
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    
     WNDCLASSEXA wc = {sizeof(WNDCLASSEXA)};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
@@ -685,7 +660,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     SendMessage(hwndScreenLabel, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
 
     g_hwndScreenCombo = CreateWindowExA(0, "COMBOBOX", NULL, WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-        115, 235, 170, 150, g_hwndMain, (HMENU)ID_SCREEN_COMBO, hInstance, NULL);
+        115, 235, 150, 150, g_hwndMain, (HMENU)ID_SCREEN_COMBO, hInstance, NULL);
     SendMessage(g_hwndScreenCombo, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
     
     // Populate screen combo
@@ -695,11 +670,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     SendMessageA(g_hwndScreenCombo, CB_SETCURSEL, 0, 0);
 
     HWND hwndFPSLabel = CreateWindowExA(0, "STATIC", "Target FPS:", WS_CHILD | WS_VISIBLE,
-        295, 237, 75, 20, g_hwndMain, NULL, hInstance, NULL);
+        275, 237, 75, 20, g_hwndMain, NULL, hInstance, NULL);
     SendMessage(hwndFPSLabel, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
 
     g_hwndFPSCombo = CreateWindowExA(0, "COMBOBOX", NULL, WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-        375, 235, 65, 150, g_hwndMain, (HMENU)ID_FPS_COMBO, hInstance, NULL);
+        355, 235, 65, 150, g_hwndMain, (HMENU)ID_FPS_COMBO, hInstance, NULL);
     SendMessageA(g_hwndFPSCombo, CB_ADDSTRING, 0, (LPARAM)"15");
     SendMessageA(g_hwndFPSCombo, CB_ADDSTRING, 0, (LPARAM)"20");
     SendMessageA(g_hwndFPSCombo, CB_ADDSTRING, 0, (LPARAM)"25");
@@ -709,21 +684,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     SendMessageA(g_hwndFPSCombo, CB_ADDSTRING, 0, (LPARAM)"60");
     SendMessageA(g_hwndFPSCombo, CB_SETCURSEL, 3, 0);
     SendMessage(g_hwndFPSCombo, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
-
-    HWND hwndFitLabel = CreateWindowExA(0, "STATIC", "Fit Mode:", WS_CHILD | WS_VISIBLE,
-        35, 256, 75, 20, g_hwndMain, NULL, hInstance, NULL);
-    SendMessage(hwndFitLabel, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
-
-    g_hwndFitModeCombo = CreateWindowExA(0, "COMBOBOX", NULL, WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-        115, 254, 90, 150, g_hwndMain, (HMENU)ID_FIT_MODE_COMBO, hInstance, NULL);
-    SendMessageA(g_hwndFitModeCombo, CB_ADDSTRING, 0, (LPARAM)"Fill");
-    SendMessageA(g_hwndFitModeCombo, CB_ADDSTRING, 0, (LPARAM)"Fit");
-    SendMessageA(g_hwndFitModeCombo, CB_ADDSTRING, 0, (LPARAM)"Stretch");
-    SendMessageA(g_hwndFitModeCombo, CB_SETCURSEL, 0, 0);
-    SendMessage(g_hwndFitModeCombo, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
     
     g_hwndCursorCheck = CreateWindowExA(0, "BUTTON", "Show Cursor", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-        215, 256, 145, 20, g_hwndMain, (HMENU)ID_CURSOR_CHECK, hInstance, NULL);
+        430, 237, 85, 20, g_hwndMain, (HMENU)ID_CURSOR_CHECK, hInstance, NULL);
     SendMessage(g_hwndCursorCheck, BM_SETCHECK, BST_CHECKED, 0);
     SendMessage(g_hwndCursorCheck, WM_SETFONT, (WPARAM)g_hFontNormal, TRUE);
     
