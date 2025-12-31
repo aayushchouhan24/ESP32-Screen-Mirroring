@@ -3,8 +3,8 @@
 #include <WiFiUdp.h>
 
 // WiFi config
-const char* WIFI_SSID = "Sheryians HQ";
-const char* WIFI_PASS = "Unique@1011";
+const char* WIFI_SSID = "YOUR_WIFI_SSID";
+const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
 
 // UDP config
 WiFiUDP Udp;
